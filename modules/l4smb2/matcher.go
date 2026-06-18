@@ -30,11 +30,21 @@ func init() {
 }
 
 // MatchSMB2 matches connections that speak SMB2 or SMB3 protocol.
-// It identifies the SMB2/3 header by checking the protocol magic bytes,
-// the fixed StructureSize of 64, and a valid Command code, as described
-// in [MS-SMB2] section 2.2.1.
+// It supports both transport variants:
+//
+//   - Direct TCP (port 445): the SMB2 header starts at byte 0 of the stream.
+//   - NetBIOS Session Service (port 139): the SMB2 header is preceded by a
+//     4-byte NetBIOS framing header (RFC 1002 §4.3.2).
+//
+// The matcher tries the direct-TCP variant first; if the magic is not found
+// at offset 0 it tries again at offset 4 (NetBIOS framing). This allows the
+// same matcher to be used regardless of the listening port.
+//
+// The identification is based on [MS-SMB2] section 2.2.1:
+// ProtocolId, StructureSize (must be 64), valid Command code, and
+// 8-byte-aligned NextCommand (when present).
 type MatchSMB2 struct {
-	// If true, also match SMB1 (NetBIOS/CIFS) connections by detecting the
+	// If true, also match SMB1 (CIFS / NetBIOS) connections by accepting the
 	// legacy 0xFF 'S' 'M' 'B' magic. Defaults to false.
 	AllowSMB1 bool `json:"allow_smb1,omitempty"`
 }
@@ -48,65 +58,76 @@ func (m *MatchSMB2) CaddyModule() caddy.ModuleInfo {
 }
 
 // Match returns true if the connection looks like SMB2/3.
-// It reads the minimum amount of bytes necessary (the NetBIOS session
-// service header + the SMB2 header = 4 + 64 bytes) without consuming
-// them, so subsequent handlers still see the original stream.
+//
+// It reads SMB2NetBIOSHeaderSize+SMB2HeaderSize bytes (68 bytes total) and
+// tries to locate the SMB2 header at offset 0 (Direct TCP) or offset 4
+// (NetBIOS framing). The bytes are not consumed; caddy-l4 replays them for
+// subsequent handlers.
 func (m *MatchSMB2) Match(cx *layer4.Connection) (bool, error) {
-	// We need at least 4 (NetBIOS) + 4 (ProtocolId) + 2 (StructureSize) +
-	// 2 (CreditCharge) + 4 (Status) + 2 (Command) = 18 bytes to perform a
-	// meaningful check. Reading the full 68-byte NetBIOS+SMB2 header gives
-	// us everything we need and keeps the logic clean.
+	// Read enough bytes to cover both transport variants:
+	//   Direct TCP : SMB2 header at buf[0..63]
+	//   NetBIOS    : SMB2 header at buf[4..67]
 	buf := make([]byte, SMB2NetBIOSHeaderSize+SMB2HeaderSize)
 	n, err := io.ReadFull(cx, buf)
 	if err != nil || n < len(buf) {
-		// Not enough data: not SMB2.
 		return false, nil //nolint:nilerr
 	}
 
-	// The SMB2 header starts immediately after the 4-byte NetBIOS
-	// Session Service header.
-	smb2Header := buf[SMB2NetBIOSHeaderSize:]
-
-	// --- Check 1: Protocol magic bytes ---
-	// SMB2/3 always starts with 0xFE 'S' 'M' 'B'.
-	// If allow_smb1 is set we also accept 0xFF 'S' 'M' 'B'.
-	if bytes.Equal(smb2Header[SMB2OffProtocolID:SMB2OffProtocolID+4], smb1Magic[:]) {
-		return m.AllowSMB1, nil
+	// Try Direct TCP first (offset 0), then NetBIOS framing (offset 4).
+	for _, offset := range []int{0, SMB2NetBIOSHeaderSize} {
+		if offset+SMB2HeaderSize > len(buf) {
+			break
+		}
+		hdr := buf[offset : offset+SMB2HeaderSize]
+		if matched, ok := m.matchHeader(hdr); ok {
+			return matched, nil
+		}
 	}
-	if !bytes.Equal(smb2Header[SMB2OffProtocolID:SMB2OffProtocolID+4], smb2Magic[:]) {
-		return false, nil
+
+	return false, nil
+}
+
+// matchHeader inspects a 64-byte slice as an SMB2 header.
+// Returns (result, true) when the header is conclusively identified
+// (SMB2, SMB1, or invalid), and (false, false) when the magic bytes
+// do not belong to SMB at all (so the caller can try the next offset).
+func (m *MatchSMB2) matchHeader(hdr []byte) (matched bool, conclusive bool) {
+	magic := hdr[SMB2OffProtocolID : SMB2OffProtocolID+4]
+
+	// SMB1 magic (0xFF 'S' 'M' 'B')
+	if bytes.Equal(magic, smb1Magic[:]) {
+		return m.AllowSMB1, true
+	}
+
+	// SMB2/3 magic (0xFE 'S' 'M' 'B')
+	if !bytes.Equal(magic, smb2Magic[:]) {
+		// Not SMB at this offset; let the caller try the next one.
+		return false, false
 	}
 
 	// --- Check 2: StructureSize MUST be 64 ---
 	// [MS-SMB2] 2.2.1.1 / 2.2.1.2: "This MUST be set to 64".
-	structureSize := binary.LittleEndian.Uint16(smb2Header[SMB2OffStructureSize : SMB2OffStructureSize+2])
+	structureSize := binary.LittleEndian.Uint16(hdr[SMB2OffStructureSize : SMB2OffStructureSize+2])
 	if structureSize != SMB2HeaderSize {
-		return false, nil
+		return false, true
 	}
 
 	// --- Check 3: Command MUST be a known value ---
-	// Valid commands are 0x0000 (NEGOTIATE) through 0x0013 (SERVER_TO_CLIENT_NOTIFICATION).
-	command := binary.LittleEndian.Uint16(smb2Header[SMB2OffCommand : SMB2OffCommand+2])
+	// Valid range: 0x0000 (NEGOTIATE) – 0x0013 (SERVER_TO_CLIENT_NOTIFICATION).
+	command := binary.LittleEndian.Uint16(hdr[SMB2OffCommand : SMB2OffCommand+2])
 	if command > SMB2CommandMax {
-		return false, nil
+		return false, true
 	}
 
 	// --- Check 4: NextCommand alignment (compound requests) ---
-	// If non-zero, it MUST be 8-byte aligned and must not overflow the buffer.
-	// [MS-SMB2] 2.2.1.1 / 2.2.1.2: NextCommand field semantics.
-	nextCmd := binary.LittleEndian.Uint32(smb2Header[SMB2OffNextCommand : SMB2OffNextCommand+4])
-	if nextCmd != 0 {
-		if nextCmd%8 != 0 {
-			return false, nil
-		}
-		// We can only verify this for data we have already read.
-		if int(nextCmd)+SMB2HeaderSize > len(smb2Header) {
-			// Offset goes beyond what we read: indeterminate, allow it.
-			// A more thorough check would require reading nextCmd bytes ahead.
-		}
+	// Non-zero values MUST be 8-byte aligned.
+	// [MS-SMB2] 2.2.1.1 / 2.2.1.2.
+	nextCmd := binary.LittleEndian.Uint32(hdr[SMB2OffNextCommand : SMB2OffNextCommand+4])
+	if nextCmd != 0 && nextCmd%8 != 0 {
+		return false, true
 	}
 
-	return true, nil
+	return true, true
 }
 
 // UnmarshalCaddyfile sets up the MatchSMB2 from Caddyfile tokens. Syntax:
@@ -161,16 +182,17 @@ var (
 // SMB2/3 header offsets and constants as defined in [MS-SMB2] section 2.2.1.
 const (
 	// SMB2NetBIOSHeaderSize is the size of the NetBIOS Session Service
-	// header that wraps every SMB2 packet when transported over TCP port 445.
-	// It consists of 1 byte Message Type + 3 bytes Length.
+	// framing header (RFC 1002 §4.3.2) that precedes every SMB2 packet
+	// when transported over TCP port 139.
+	// Layout: 1 byte Message Type (0x00) + 3 bytes big-endian length.
+	// On TCP port 445 (Direct TCP) this framing is absent.
 	SMB2NetBIOSHeaderSize = 4
 
 	// SMB2HeaderSize is the fixed size of the SMB2 packet header in bytes.
 	// [MS-SMB2] 2.2.1.1 and 2.2.1.2: StructureSize MUST be 64.
 	SMB2HeaderSize = 64
 
-	// Offsets within the SMB2 header (i.e. relative to byte 0 of the SMB2
-	// magic, AFTER the NetBIOS framing bytes).
+	// Offsets within the 64-byte SMB2 header (relative to the SMB2 magic byte).
 	SMB2OffProtocolID    = 0  // 4 bytes: 0xFE 'S' 'M' 'B'
 	SMB2OffStructureSize = 4  // 2 bytes, little-endian, MUST be 64
 	SMB2OffCreditCharge  = 6  // 2 bytes
@@ -182,13 +204,13 @@ const (
 	SMB2OffMessageID     = 24 // 8 bytes
 
 	// SMB2 flag bits  [MS-SMB2] 2.2.1.1.
-	SMB2FlagsServerToRedir    uint32 = 0x00000001
-	SMB2FlagsAsyncCommand     uint32 = 0x00000002
-	SMB2FlagsRelatedOps       uint32 = 0x00000004
-	SMB2FlagsSigned           uint32 = 0x00000008
-	SMB2FlagsPriorityMask     uint32 = 0x00000070
-	SMB2FlagsDFSOperations    uint32 = 0x10000000
-	SMB2FlagsReplayOperation  uint32 = 0x20000000
+	SMB2FlagsServerToRedir   uint32 = 0x00000001
+	SMB2FlagsAsyncCommand    uint32 = 0x00000002
+	SMB2FlagsRelatedOps      uint32 = 0x00000004
+	SMB2FlagsSigned          uint32 = 0x00000008
+	SMB2FlagsPriorityMask    uint32 = 0x00000070
+	SMB2FlagsDFSOperations   uint32 = 0x10000000
+	SMB2FlagsReplayOperation uint32 = 0x20000000
 
 	// SMB2CommandMax is the highest valid Command code defined in
 	// [MS-SMB2] section 2.2.1 (SMB2 SERVER_TO_CLIENT_NOTIFICATION = 0x0013).
@@ -223,23 +245,30 @@ const (
 // ref: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/e14db7ff-763a-4263-8b10-0c3944f52fc5
 // ref: https://winprotocoldoc.blob.core.windows.net/productionwindowsarchives/MS-SMB2/%5BMS-SMB2%5D.pdf
 //
-// Every SMB2 packet transported over TCP port 445 is prefixed with a 4-byte
-// NetBIOS Session Service header (RFC 1002 §4.3.2):
+// Transport variants:
 //
-//	[0]     Message Type (1 byte)  = 0x00 (SESSION MESSAGE)
-//	[1-3]   Length   (3 bytes, big-endian) = length of the following SMB2 data
+//  1. Direct TCP (TCP port 445)  — no framing, stream starts directly with SMB2 magic:
+//     [0-3]   ProtocolId   = 0xFE 0x53 0x4D 0x42  (0xFE 'S' 'M' 'B')
+//     [4-5]   StructureSize = 64  (little-endian)
+//     ...
 //
-// The SMB2 header immediately follows and MUST be exactly 64 bytes:
+//  2. NetBIOS Session Service (TCP port 139, RFC 1002 §4.3.2) — 4-byte framing prefix:
+//     [0]     Message Type = 0x00 (SESSION MESSAGE)
+//     [1-3]   Length (3 bytes, big-endian) = byte length of the SMB2 payload that follows
+//     [4-7]   ProtocolId   = 0xFE 'S' 'M' 'B'
+//     [8-9]   StructureSize = 64
+//     ...
 //
-//	[0-3]   ProtocolId   = 0xFE 0x53 0x4D 0x42  (0xFE 'S' 'M' 'B')
-//	[4-5]   StructureSize = 64  (little-endian)
-//	[6-7]   CreditCharge
-//	[8-11]  (ChannelSequence,Reserved) / Status
-//	[12-13] Command       (one of SMB2CommandNegotiate … SMB2CommandServerToClientNotify)
-//	[14-15] CreditRequest / CreditResponse
-//	[16-19] Flags
-//	[20-23] NextCommand   (0 or 8-byte-aligned offset to next compound header)
-//	[24-31] MessageId
-//	[32-39] AsyncId  (ASYNC header) / Reserved+TreeId  (SYNC header)
-//	[40-47] SessionId
-//	[48-63] Signature     (16 bytes, all zero when not signed)
+// SMB2 header fields (offsets relative to ProtocolId):
+//     [0-3]   ProtocolId
+//     [4-5]   StructureSize  (MUST be 64)
+//     [6-7]   CreditCharge
+//     [8-11]  (ChannelSequence,Reserved) / Status
+//     [12-13] Command        (0x0000 – 0x0013)
+//     [14-15] CreditRequest / CreditResponse
+//     [16-19] Flags
+//     [20-23] NextCommand    (0 or 8-byte-aligned offset to next compound header)
+//     [24-31] MessageId
+//     [32-39] AsyncId (ASYNC) / Reserved+TreeId (SYNC)
+//     [40-47] SessionId
+//     [48-63] Signature      (16 bytes, all zero when unsigned)

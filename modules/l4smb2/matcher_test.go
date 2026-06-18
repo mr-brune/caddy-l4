@@ -25,28 +25,34 @@ import (
 	"github.com/mholt/caddy-l4/layer4"
 )
 
-// buildPacket returns a complete NetBIOS-framed SMB2 header as a byte slice.
-// Callers can mutate individual bytes before passing to matchSMB2.
-func buildPacket() []byte {
+// buildDirectPacket returns a 68-byte buffer where the SMB2 header is at
+// offset 0 (Direct TCP / port 445, no NetBIOS framing).
+func buildDirectPacket() []byte {
 	pkt := make([]byte, SMB2NetBIOSHeaderSize+SMB2HeaderSize)
-
-	// NetBIOS Session Message (type 0x00)
-	pkt[0] = 0x00
-	binary.BigEndian.PutUint32(pkt[0:4], uint32(SMB2HeaderSize)) // length in upper 3 bytes
-
-	// SMB2 magic
-	copy(pkt[SMB2NetBIOSHeaderSize+SMB2OffProtocolID:], smb2Magic[:])
-
-	// StructureSize = 64 (little-endian)
-	binary.LittleEndian.PutUint16(pkt[SMB2NetBIOSHeaderSize+SMB2OffStructureSize:], SMB2HeaderSize)
-
-	// Command = NEGOTIATE (0x0000)
-	binary.LittleEndian.PutUint16(pkt[SMB2NetBIOSHeaderSize+SMB2OffCommand:], SMB2CommandNegotiate)
-
-	// NextCommand = 0 (not compounded)
-	binary.LittleEndian.PutUint32(pkt[SMB2NetBIOSHeaderSize+SMB2OffNextCommand:], 0)
-
+	writeSMB2Header(pkt, 0)
 	return pkt
+}
+
+// buildNetBIOSPacket returns a 68-byte buffer where the first 4 bytes are a
+// NetBIOS Session Service header and the SMB2 header starts at offset 4
+// (port 139 transport).
+func buildNetBIOSPacket() []byte {
+	pkt := make([]byte, SMB2NetBIOSHeaderSize+SMB2HeaderSize)
+	// NetBIOS SESSION MESSAGE, length = SMB2HeaderSize
+	pkt[0] = 0x00
+	binary.BigEndian.PutUint32(pkt[0:4], uint32(SMB2HeaderSize)) // upper byte is type=0
+	writeSMB2Header(pkt, SMB2NetBIOSHeaderSize)
+	return pkt
+}
+
+// writeSMB2Header writes a minimal valid SMB2 NEGOTIATE header into buf
+// starting at the given offset.
+func writeSMB2Header(buf []byte, offset int) {
+	hdr := buf[offset:]
+	copy(hdr[SMB2OffProtocolID:], smb2Magic[:])
+	binary.LittleEndian.PutUint16(hdr[SMB2OffStructureSize:], SMB2HeaderSize)
+	binary.LittleEndian.PutUint16(hdr[SMB2OffCommand:], SMB2CommandNegotiate)
+	binary.LittleEndian.PutUint32(hdr[SMB2OffNextCommand:], 0)
 }
 
 func matchSMB2(t *testing.T, m *MatchSMB2, data []byte) bool {
@@ -73,92 +79,121 @@ func matchSMB2(t *testing.T, m *MatchSMB2, data []byte) bool {
 	return matched
 }
 
-// --- Tests ---
+// ---- Direct TCP (port 445) tests ----
 
-func TestMatchSMB2_ValidNegotiate(t *testing.T) {
-	if !matchSMB2(t, &MatchSMB2{}, buildPacket()) {
-		t.Fatal("expected SMB2 NEGOTIATE to match")
+func TestMatchSMB2_DirectTCP_Valid(t *testing.T) {
+	if !matchSMB2(t, &MatchSMB2{}, buildDirectPacket()) {
+		t.Fatal("expected Direct TCP SMB2 NEGOTIATE to match")
 	}
 }
 
-func TestMatchSMB2_AllCommands(t *testing.T) {
+func TestMatchSMB2_DirectTCP_AllCommands(t *testing.T) {
 	m := &MatchSMB2{}
 	for cmd := uint16(0); cmd <= SMB2CommandMax; cmd++ {
-		pkt := buildPacket()
-		binary.LittleEndian.PutUint16(pkt[SMB2NetBIOSHeaderSize+SMB2OffCommand:], cmd)
+		pkt := buildDirectPacket()
+		binary.LittleEndian.PutUint16(pkt[SMB2OffCommand:], cmd)
 		if !matchSMB2(t, m, pkt) {
-			t.Errorf("expected command 0x%04X to match", cmd)
+			t.Errorf("Direct TCP: expected command 0x%04X to match", cmd)
 		}
 	}
 }
 
-func TestMatchSMB2_InvalidCommand(t *testing.T) {
-	pkt := buildPacket()
+func TestMatchSMB2_DirectTCP_InvalidCommand(t *testing.T) {
+	pkt := buildDirectPacket()
+	binary.LittleEndian.PutUint16(pkt[SMB2OffCommand:], SMB2CommandMax+1)
+	if matchSMB2(t, &MatchSMB2{}, pkt) {
+		t.Fatal("Direct TCP: expected invalid command to NOT match")
+	}
+}
+
+func TestMatchSMB2_DirectTCP_BadStructureSize(t *testing.T) {
+	pkt := buildDirectPacket()
+	binary.LittleEndian.PutUint16(pkt[SMB2OffStructureSize:], 32)
+	if matchSMB2(t, &MatchSMB2{}, pkt) {
+		t.Fatal("Direct TCP: expected wrong StructureSize to NOT match")
+	}
+}
+
+// ---- NetBIOS (port 139) tests ----
+
+func TestMatchSMB2_NetBIOS_Valid(t *testing.T) {
+	if !matchSMB2(t, &MatchSMB2{}, buildNetBIOSPacket()) {
+		t.Fatal("expected NetBIOS-framed SMB2 NEGOTIATE to match")
+	}
+}
+
+func TestMatchSMB2_NetBIOS_AllCommands(t *testing.T) {
+	m := &MatchSMB2{}
+	for cmd := uint16(0); cmd <= SMB2CommandMax; cmd++ {
+		pkt := buildNetBIOSPacket()
+		binary.LittleEndian.PutUint16(pkt[SMB2NetBIOSHeaderSize+SMB2OffCommand:], cmd)
+		if !matchSMB2(t, m, pkt) {
+			t.Errorf("NetBIOS: expected command 0x%04X to match", cmd)
+		}
+	}
+}
+
+func TestMatchSMB2_NetBIOS_InvalidCommand(t *testing.T) {
+	pkt := buildNetBIOSPacket()
 	binary.LittleEndian.PutUint16(pkt[SMB2NetBIOSHeaderSize+SMB2OffCommand:], SMB2CommandMax+1)
 	if matchSMB2(t, &MatchSMB2{}, pkt) {
-		t.Fatal("expected invalid command to NOT match")
+		t.Fatal("NetBIOS: expected invalid command to NOT match")
 	}
 }
 
-func TestMatchSMB2_BadMagic(t *testing.T) {
-	pkt := buildPacket()
-	pkt[SMB2NetBIOSHeaderSize+SMB2OffProtocolID] = 0x00 // corrupt magic
-	if matchSMB2(t, &MatchSMB2{}, pkt) {
-		t.Fatal("expected corrupted magic to NOT match")
-	}
-}
+// ---- SMB1 tests ----
 
-func TestMatchSMB2_BadStructureSize(t *testing.T) {
-	pkt := buildPacket()
-	binary.LittleEndian.PutUint16(pkt[SMB2NetBIOSHeaderSize+SMB2OffStructureSize:], 32)
-	if matchSMB2(t, &MatchSMB2{}, pkt) {
-		t.Fatal("expected wrong StructureSize to NOT match")
-	}
-}
-
-func TestMatchSMB2_TooShort(t *testing.T) {
-	pkt := buildPacket()[:10] // truncated
-	if matchSMB2(t, &MatchSMB2{}, pkt) {
-		t.Fatal("expected truncated packet to NOT match")
-	}
-}
-
-func TestMatchSMB2_SMB1Rejected(t *testing.T) {
-	pkt := buildPacket()
-	copy(pkt[SMB2NetBIOSHeaderSize+SMB2OffProtocolID:], smb1Magic[:])
+func TestMatchSMB2_SMB1_RejectedByDefault(t *testing.T) {
+	pkt := buildDirectPacket()
+	copy(pkt[SMB2OffProtocolID:], smb1Magic[:])
 	if matchSMB2(t, &MatchSMB2{}, pkt) {
 		t.Fatal("expected SMB1 magic to NOT match when AllowSMB1=false")
 	}
 }
 
-func TestMatchSMB2_SMB1Allowed(t *testing.T) {
-	pkt := buildPacket()
-	copy(pkt[SMB2NetBIOSHeaderSize+SMB2OffProtocolID:], smb1Magic[:])
+func TestMatchSMB2_SMB1_AllowedWhenFlagSet(t *testing.T) {
+	pkt := buildDirectPacket()
+	copy(pkt[SMB2OffProtocolID:], smb1Magic[:])
 	if !matchSMB2(t, &MatchSMB2{AllowSMB1: true}, pkt) {
 		t.Fatal("expected SMB1 magic to match when AllowSMB1=true")
 	}
 }
 
+// ---- Generic tests ----
+
+func TestMatchSMB2_TooShort(t *testing.T) {
+	pkt := buildDirectPacket()[:10]
+	if matchSMB2(t, &MatchSMB2{}, pkt) {
+		t.Fatal("expected truncated packet to NOT match")
+	}
+}
+
+func TestMatchSMB2_BadMagic(t *testing.T) {
+	pkt := buildDirectPacket()
+	pkt[SMB2OffProtocolID] = 0x00
+	if matchSMB2(t, &MatchSMB2{}, pkt) {
+		t.Fatal("expected corrupted magic to NOT match")
+	}
+}
+
 func TestMatchSMB2_NextCommandMisaligned(t *testing.T) {
-	pkt := buildPacket()
-	binary.LittleEndian.PutUint32(pkt[SMB2NetBIOSHeaderSize+SMB2OffNextCommand:], 7) // not 8-aligned
+	pkt := buildDirectPacket()
+	binary.LittleEndian.PutUint32(pkt[SMB2OffNextCommand:], 7) // not 8-aligned
 	if matchSMB2(t, &MatchSMB2{}, pkt) {
 		t.Fatal("expected misaligned NextCommand to NOT match")
 	}
 }
 
 func TestMatchSMB2_NextCommandAligned(t *testing.T) {
-	pkt := buildPacket()
-	// 8 is valid even if it points outside our 68-byte buffer (indeterminate -> allowed)
-	binary.LittleEndian.PutUint32(pkt[SMB2NetBIOSHeaderSize+SMB2OffNextCommand:], 8)
+	pkt := buildDirectPacket()
+	binary.LittleEndian.PutUint32(pkt[SMB2OffNextCommand:], 8)
 	if !matchSMB2(t, &MatchSMB2{}, pkt) {
-		t.Fatal("expected aligned NextCommand to match")
+		t.Fatal("expected 8-aligned NextCommand to match")
 	}
 }
 
-// --- Test helpers ---
+// ---- Test helpers ----
 
-// fixedReader provides a fixed byte slice as an io.Reader.
 type fixedReader struct {
 	data   []byte
 	offset int
@@ -173,7 +208,6 @@ func (r *fixedReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// pipeConn wraps a Reader to satisfy net.Conn for layer4.WrapConnection.
 type pipeConn struct {
 	*fixedReader
 	net.Conn
